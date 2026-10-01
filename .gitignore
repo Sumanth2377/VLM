@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+
+# Local environments and caches
+.venv/
+.conda*/
+.cache/
+
+# Models, datasets, checkpoints, and experiment outputs
+data/
+models/
+checkpoints/
+results/
+logs/
+
+# Local presentation build artifacts
+.chart-data-*/
+.codex-finalizer/
+.codex_ppt_build/
+deliverables/
