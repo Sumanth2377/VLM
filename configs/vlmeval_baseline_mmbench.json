@@ -1,0 +1,18 @@
+{
+  "model": {
+    "Qwen3VL-2B-Baseline": {
+      "class": "Qwen3VLChat",
+      "model_path": "Qwen/Qwen3-VL-2B-Instruct",
+      "use_custom_prompt": false,
+      "use_vllm": false,
+      "temperature": 0,
+      "max_new_tokens": 128
+    }
+  },
+  "data": {
+    "MMBench_DEV_EN": {
+      "class": "ImageMCQDataset",
+      "dataset": "MMBench_DEV_EN"
+    }
+  }
+}

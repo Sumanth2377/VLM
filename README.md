@@ -38,10 +38,13 @@ exact-match scoring and had zero inference or judge failures.
 
 - `vlm_kd_end_to_end.py`: original 1K online KD pipeline.
 - `vlm_kd_online_10k.py`: expanded 10K online hard-response KD pipeline.
+- `scripts/train_offline_kd_10k.py`: cached teacher-only offline KD.
+- `scripts/train_offline_mixed_kd_10k.py`: 75/25 supervised-teacher mixture.
+- `scripts/eval_mmbench_1000.py`: parameterized fixed-subset evaluation.
+- `scripts/merge_lora_adapter.py`: safe LoRA merge utility.
+- `configs/`: official MMBench EN/CN VLMEvalKit configurations.
 
-The offline, mixed-KD, merge, and VLMEvalKit scripts currently remain on the
-Linux training machine and must be copied into this repository for a complete
-source-code archive.
+See `RECOVERED_REMOTE_WORK.md` for provenance and verified remote results.
 
 ## Original 1K experiment
 
