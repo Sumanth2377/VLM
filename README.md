@@ -1,4 +1,4 @@
-﻿# Qwen3-VL Knowledge Distillation (VLM-KD)
+# Qwen3-VL Knowledge Distillation (VLM-KD)
 
 > **Offline response-level knowledge distillation** with ground-truth mixing —  
 > Qwen3-VL-8B teacher -> Qwen3-VL-2B student, trained on LLaVA-Instruct data, evaluated on MMBench DEV EN/CN.
