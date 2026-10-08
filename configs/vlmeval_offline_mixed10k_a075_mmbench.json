@@ -1,0 +1,18 @@
+{
+  "model": {
+    "Qwen3VL-2B-OfflineMixedKD10K-A075": {
+      "class": "Qwen3VLChat",
+      "model_path": "/home/drive1/Nvidia_6th_sem/VLM_KD/models/merged/qwen3_vl_2b_offline_mixed_kd_10k_a075",
+      "use_custom_prompt": false,
+      "use_vllm": false,
+      "temperature": 0,
+      "max_new_tokens": 128
+    }
+  },
+  "data": {
+    "MMBench_DEV_EN": {
+      "class": "ImageMCQDataset",
+      "dataset": "MMBench_DEV_EN"
+    }
+  }
+}
