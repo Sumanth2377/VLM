@@ -3,8 +3,7 @@
 > **Offline response-level knowledge distillation** with ground-truth mixing —  
 > Qwen3-VL-8B teacher -> Qwen3-VL-2B student, trained on LLaVA-Instruct data, evaluated on MMBench DEV EN/CN.
 
----
-
+ 
 ## Overview
 
 The primary objective of this project is to investigate whether the capabilities of the larger **Qwen3-VL-8B-Instruct** model can be transferred to the smaller **Qwen3-VL-2B-Instruct** student without increasing the student model size.
