@@ -1,0 +1,1564 @@
+# Qwen3-VL Knowledge Distillation — Complete Project Code Reference
+
+This file consolidates the code used/reconstructed for the project:
+Qwen3-VL-8B teacher -> Qwen3-VL-2B student
+
+IMPORTANT TERMINOLOGY
+---------------------
+This implementation is OFFLINE response-level KD with ground-truth mixing.
+It is NOT online KD and it does NOT combine online and offline KD.
+
+10K:
+- 7,500 ground-truth target steps
+- 2,500 offline teacher-response target steps
+
+50K:
+- 37,500 ground-truth target steps
+- 12,500 offline teacher-response target steps
+
+The conceptual expected objective is:
+    L = 0.75 * L_GT + 0.25 * L_teacher
+
+However, the implementation uses a fixed shuffled schedule and processes ONE target
+per optimization step. It does not calculate both losses in the same forward pass.
+
+======================================================================
+1. CORE 50K TRAINING SCRIPT
+======================================================================
+
+```python
+import json
+import os
+import random
+import time
+from datetime import datetime
+from pathlib import Path
+
+import torch
+from PIL import Image
+from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+
+TEACHER_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+STUDENT_NAME = "Qwen/Qwen3-VL-2B-Instruct"
+
+TRAIN_PATH = os.environ.get(
+    "KD_TRAIN_PATH",
+    "data/train_llava/train_10000.json",
+)
+
+IMAGE_DIR = Path("data/train_llava/images")
+
+TEACHER_RESPONSES_PATH = Path(
+    "results/kd_teacher_50k/teacher_responses_50k.jsonl"
+)
+
+CHECKPOINT_DIR = Path(os.environ.get(
+    "KD_CHECKPOINT_DIR",
+    "checkpoints/offline_mixed_kd_2b_10k_a075",
+))
+
+RESULT_DIR = Path(os.environ.get(
+    "KD_RESULT_DIR",
+    "results/kd_offline_mixed_10k_a075",
+))
+
+LOG_DIR = Path(os.environ.get(
+    "KD_LOG_DIR",
+    "logs/offline_mixed_10k_a075",
+))
+
+MAX_STEPS = int(os.environ.get("KD_MAX_STEPS", "10000"))
+SAVE_EVERY = int(os.environ.get("KD_SAVE_EVERY", "500"))
+LEARNING_RATE = float(os.environ.get("KD_LEARNING_RATE", "1e-5"))
+
+GROUND_TRUTH_WEIGHT = float(
+    os.environ.get("KD_GROUND_TRUTH_WEIGHT", "0.75")
+)
+TEACHER_WEIGHT = 1.0 - GROUND_TRUTH_WEIGHT
+
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.05
+
+DEVICE = "cuda:0"
+TRAINING_SEED = 123
+
+# Optional resume support
+RESUME_CHECKPOINT = os.environ.get(
+    "KD_RESUME_CHECKPOINT", ""
+).strip()
+
+random.seed(TRAINING_SEED)
+torch.manual_seed(TRAINING_SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(TRAINING_SEED)
+
+
+def first_training_pair(record):
+    conversations = record["conversations"]
+
+    for index, turn in enumerate(conversations):
+
+        if turn["from"] != "human":
+            continue
+
+        question = (
+            turn["value"]
+            .replace("<image>", "")
+            .strip()
+        )
+
+        if index + 1 >= len(conversations):
+            break
+
+        answer_turn = conversations[index + 1]
+
+        if answer_turn["from"] != "gpt":
+            break
+
+        answer = answer_turn["value"].strip()
+
+        if question and answer:
+            return question, answer
+
+    raise ValueError(
+        f"No valid first human/GPT pair in record {record['id']}"
+    )
+
+
+def build_user_message(image, question):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
+
+
+def load_records():
+    with open(TRAIN_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            obj,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+print("=" * 80)
+print("OFFLINE RESPONSE-LEVEL KD TRAINING")
+print("=" * 80)
+
+print("Start:", datetime.now().isoformat())
+print("Teacher:", TEACHER_NAME)
+print("Student:", STUDENT_NAME)
+print("Precision: float16")
+print("Ground-truth weight:", GROUND_TRUTH_WEIGHT)
+print("Teacher weight:", TEACHER_WEIGHT)
+print("Device:", DEVICE)
+print("Training records:", TRAIN_PATH)
+print("Max steps:", MAX_STEPS)
+print("Resume checkpoint:", RESUME_CHECKPOINT or "none")
+
+
+records = load_records()
+
+
+# ---------------------------------------------------------------
+# Load cached teacher responses
+# IMPORTANT: key = (image, question)
+# ---------------------------------------------------------------
+
+cache_paths = [
+    Path(
+        "results/kd_online_10k/"
+        "online_kd_teacher_responses.jsonl"
+    ),
+    TEACHER_RESPONSES_PATH,
+]
+
+cached_responses = {}
+
+for cache_path in cache_paths:
+
+    if not cache_path.exists():
+        continue
+
+    with cache_path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line in f:
+
+            if not line.strip():
+                continue
+
+            item = json.loads(line)
+
+            image = str(item["image"])
+            question = str(item["question"]).strip()
+            teacher_response = (
+                item["teacher_response"].strip()
+            )
+
+            if not teacher_response:
+                raise ValueError(
+                    f"Empty teacher response for "
+                    f"image={image}, "
+                    f"question={question[:80]}"
+                )
+
+            cached_responses[
+                (image, question)
+            ] = teacher_response
+
+
+print(
+    "Unique cached teacher responses:",
+    len(cached_responses),
+)
+
+
+if len(records) != 50000:
+    raise ValueError(
+        f"Expected exactly 50000 training records, "
+        f"found {len(records)}"
+    )
+
+if MAX_STEPS < 1 or MAX_STEPS > len(records):
+    raise ValueError(
+        f"KD_MAX_STEPS must be between 1 and {len(records)}"
+    )
+
+
+# ---------------------------------------------------------------
+# Validate question/answer extraction
+# ---------------------------------------------------------------
+
+for record in records:
+    first_training_pair(record)
+
+
+# ---------------------------------------------------------------
+# Fixed 75/25 schedule
+# ---------------------------------------------------------------
+
+ground_truth_steps = round(
+    MAX_STEPS * GROUND_TRUTH_WEIGHT
+)
+
+teacher_steps = (
+    MAX_STEPS - ground_truth_steps
+)
+
+target_schedule = (
+    ["ground_truth"] * ground_truth_steps
+    +
+    ["teacher"] * teacher_steps
+)
+
+random.Random(
+    TRAINING_SEED
+).shuffle(target_schedule)
+
+print(
+    "Scheduled ground-truth steps:",
+    ground_truth_steps,
+)
+
+print(
+    "Scheduled teacher steps:",
+    teacher_steps,
+)
+
+
+# ---------------------------------------------------------------
+# Student model
+# ---------------------------------------------------------------
+
+print("\nLoading student...")
+
+student = Qwen3VLForConditionalGeneration.from_pretrained(
+    STUDENT_NAME,
+    torch_dtype=torch.float16,
+    device_map=DEVICE,
+)
+
+student_processor = AutoProcessor.from_pretrained(
+    STUDENT_NAME
+)
+
+
+START_STEP = 0
+
+if RESUME_CHECKPOINT:
+
+    resume_path = Path(RESUME_CHECKPOINT)
+
+    state_path = (
+        resume_path /
+        "training_state.json"
+    )
+
+    optimizer_path = (
+        resume_path /
+        "optimizer.pt"
+    )
+
+    adapter_path = (
+        resume_path /
+        "adapter_model.safetensors"
+    )
+
+    if not (
+        state_path.exists()
+        and optimizer_path.exists()
+        and adapter_path.exists()
+    ):
+        raise FileNotFoundError(
+            f"Resume checkpoint is missing required files: "
+            f"{resume_path}"
+        )
+
+    with state_path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        resume_state = json.load(f)
+
+    START_STEP = int(
+        resume_state["step"]
+    )
+
+    student = PeftModel.from_pretrained(
+        student,
+        resume_path,
+        is_trainable=True,
+    )
+
+else:
+
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    student = get_peft_model(
+        student,
+        lora_config,
+    )
+
+
+student.config.use_cache = False
+
+student.train()
+
+student.print_trainable_parameters()
+
+
+# ---------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------
+
+optimizer = torch.optim.AdamW(
+    [
+        p
+        for p in student.parameters()
+        if p.requires_grad
+    ],
+    lr=LEARNING_RATE,
+)
+
+
+if RESUME_CHECKPOINT:
+
+    optimizer.load_state_dict(
+        torch.load(
+            Path(RESUME_CHECKPOINT)
+            / "optimizer.pt",
+            map_location="cpu",
+        )
+    )
+
+    print(
+        "Optimizer state restored."
+    )
+
+
+torch.cuda.reset_peak_memory_stats()
+
+loss_history = []
+
+losses_by_target = {
+    "ground_truth": [],
+    "teacher": [],
+}
+
+training_records = []
+
+training_start = time.perf_counter()
+
+
+# ---------------------------------------------------------------
+# TRAINING LOOP
+# ---------------------------------------------------------------
+
+for step in range(
+    START_STEP,
+    MAX_STEPS,
+):
+
+    record = records[
+        step % len(records)
+    ]
+
+    question, ground_truth = (
+        first_training_pair(record)
+    )
+
+    image = Image.open(
+        IMAGE_DIR / record["image"]
+    ).convert("RGB")
+
+
+    # -----------------------------------------------------------
+    # Select target
+    # -----------------------------------------------------------
+
+    target_type = target_schedule[step]
+
+    if target_type == "ground_truth":
+
+        target_response = ground_truth
+
+    else:
+
+        cache_key = (
+            str(record["image"]),
+            question,
+        )
+
+        if cache_key not in cached_responses:
+
+            raise RuntimeError(
+                f"Missing teacher response for "
+                f"image={record['image']} "
+                f"at training step {step + 1}"
+            )
+
+        target_response = (
+            cached_responses[cache_key]
+        )
+
+
+    # -----------------------------------------------------------
+    # Student conversation
+    # -----------------------------------------------------------
+
+    student_messages = [
+
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+                {
+                    "type": "text",
+                    "text": question,
+                },
+            ],
+        },
+
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": target_response,
+                },
+            ],
+        },
+    ]
+
+
+    # -----------------------------------------------------------
+    # Prompt-only sequence
+    # -----------------------------------------------------------
+
+    prompt_text = (
+        student_processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": image,
+                        },
+                        {
+                            "type": "text",
+                            "text": question,
+                        },
+                    ],
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    )
+
+
+    # -----------------------------------------------------------
+    # Prompt + answer sequence
+    # -----------------------------------------------------------
+
+    full_text = (
+        student_processor.apply_chat_template(
+            student_messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    )
+
+
+    # -----------------------------------------------------------
+    # Tokenize
+    # -----------------------------------------------------------
+
+    prompt_inputs = student_processor(
+        text=[prompt_text],
+        images=[image],
+        return_tensors="pt",
+    ).to(DEVICE)
+
+    full_inputs = student_processor(
+        text=[full_text],
+        images=[image],
+        return_tensors="pt",
+    ).to(DEVICE)
+
+
+    # -----------------------------------------------------------
+    # Labels
+    # -----------------------------------------------------------
+
+    labels = (
+        full_inputs.input_ids.clone()
+    )
+
+    prompt_length = (
+        prompt_inputs.input_ids.shape[1]
+    )
+
+    full_length = (
+        full_inputs.input_ids.shape[1]
+    )
+
+    if full_length <= prompt_length:
+        raise RuntimeError(
+            "Full sequence is not longer than prompt."
+        )
+
+
+    # -----------------------------------------------------------
+    # Mask prompt tokens
+    # Only assistant answer contributes to CE.
+    # -----------------------------------------------------------
+
+    labels[:, :prompt_length] = -100
+
+
+    # -----------------------------------------------------------
+    # Forward pass
+    # -----------------------------------------------------------
+
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
+    outputs = student(
+        **full_inputs,
+        labels=labels,
+    )
+
+    loss = outputs.loss
+
+
+    # -----------------------------------------------------------
+    # Backpropagation
+    # -----------------------------------------------------------
+
+    loss.backward()
+
+    optimizer.step()
+
+
+    # -----------------------------------------------------------
+    # Logging
+    # -----------------------------------------------------------
+
+    loss_value = float(
+        loss.detach().cpu()
+    )
+
+    loss_history.append(
+        loss_value
+    )
+
+    losses_by_target[
+        target_type
+    ].append(
+        loss_value
+    )
+
+    print(
+        f"[{step + 1:5d}/{MAX_STEPS}] "
+        f"target={target_type} "
+        f"loss={loss_value:.6f}",
+        flush=True,
+    )
+
+
+    # -----------------------------------------------------------
+    # Checkpoint
+    # -----------------------------------------------------------
+
+    if (
+        (step + 1) % SAVE_EVERY
+        == 0
+    ):
+
+        ckpt = (
+            CHECKPOINT_DIR /
+            f"step_{step + 1}"
+        )
+
+        ckpt.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        student.save_pretrained(
+            ckpt
+        )
+
+        student_processor.save_pretrained(
+            ckpt
+        )
+
+        torch.save(
+            optimizer.state_dict(),
+            ckpt / "optimizer.pt",
+        )
+
+        save_json(
+            ckpt /
+            "training_state.json",
+            {
+                "step": step + 1,
+                "loss": loss_value,
+                "timestamp":
+                    datetime.now().isoformat(),
+            },
+        )
+
+        print(
+            "Checkpoint saved:",
+            ckpt,
+            flush=True,
+        )
+
+
+    # -----------------------------------------------------------
+    # Free tensors
+    # -----------------------------------------------------------
+
+    del prompt_inputs
+    del full_inputs
+    del outputs
+
+
+# ---------------------------------------------------------------
+# FINAL SAVE
+# ---------------------------------------------------------------
+
+training_time = (
+    time.perf_counter()
+    - training_start
+)
+
+peak_vram = (
+    torch.cuda.max_memory_allocated(0)
+    / 1024**3
+)
+
+final_dir = (
+    CHECKPOINT_DIR /
+    "final"
+)
+
+student.save_pretrained(
+    final_dir
+)
+
+student_processor.save_pretrained(
+    final_dir
+)
+
+print(
+    "Final checkpoint:",
+    final_dir,
+)
+
+print(
+    "Training time:",
+    training_time,
+)
+
+print(
+    "Peak VRAM:",
+    peak_vram,
+)
+```
+
+======================================================================
+2. TEACHER RESPONSE GENERATION
+======================================================================
+
+The teacher was Qwen3-VL-8B-Instruct.
+
+Teacher generation was offline:
+- teacher loaded once
+- required teacher-target records selected using the same seed-123 schedule
+- existing 10K teacher cache reused
+- only missing teacher responses generated
+- response stored with image + question + teacher response
+
+Core generation:
+
+```python
+import json
+import random
+from pathlib import Path
+
+import torch
+from PIL import Image
+from transformers import (
+    AutoProcessor,
+    Qwen3VLForConditionalGeneration,
+)
+
+TEACHER_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+
+TRAIN_PATH = Path(
+    "data/train_llava/train_50000.json"
+)
+
+IMAGE_DIR = Path(
+    "data/train_llava/images"
+)
+
+OUTPUT_PATH = Path(
+    "results/kd_teacher_50k/"
+    "teacher_responses_50k.jsonl"
+)
+
+OLD_CACHE = Path(
+    "results/kd_online_10k/"
+    "online_kd_teacher_responses.jsonl"
+)
+
+SEED = 123
+
+MAX_STEPS = 50000
+
+GROUND_TRUTH_WEIGHT = 0.75
+
+teacher_steps = round(
+    MAX_STEPS * (1.0 - GROUND_TRUTH_WEIGHT)
+)
+
+target_schedule = (
+    ["ground_truth"] *
+    (MAX_STEPS - teacher_steps)
+    +
+    ["teacher"] *
+    teacher_steps
+)
+
+random.Random(SEED).shuffle(
+    target_schedule
+)
+
+
+def first_training_pair(record):
+
+    conversations = record["conversations"]
+
+    for i, turn in enumerate(conversations):
+
+        if turn["from"] != "human":
+            continue
+
+        question = (
+            turn["value"]
+            .replace("<image>", "")
+            .strip()
+        )
+
+        if i + 1 >= len(conversations):
+            break
+
+        answer_turn = conversations[i + 1]
+
+        if answer_turn["from"] != "gpt":
+            break
+
+        answer = (
+            answer_turn["value"]
+            .strip()
+        )
+
+        if question and answer:
+            return question, answer
+
+    raise ValueError(
+        f"Invalid record: {record['id']}"
+    )
+
+
+# Load data
+with open(
+    TRAIN_PATH,
+    "r",
+    encoding="utf-8",
+) as f:
+
+    records = json.load(f)
+
+
+# Existing cache
+cached = {}
+
+if OLD_CACHE.exists():
+
+    with OLD_CACHE.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line in f:
+
+            if not line.strip():
+                continue
+
+            item = json.loads(line)
+
+            key = (
+                str(item["image"]),
+                str(item["question"]).strip(),
+            )
+
+            cached[key] = (
+                item["teacher_response"]
+                .strip()
+            )
+
+
+# Existing new cache
+if OUTPUT_PATH.exists():
+
+    with OUTPUT_PATH.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line in f:
+
+            if not line.strip():
+                continue
+
+            item = json.loads(line)
+
+            key = (
+                str(item["image"]),
+                str(item["question"]).strip(),
+            )
+
+            cached[key] = (
+                item["teacher_response"]
+                .strip()
+            )
+
+
+teacher = (
+    Qwen3VLForConditionalGeneration
+    .from_pretrained(
+        TEACHER_NAME,
+        torch_dtype=torch.float16,
+        device_map="cuda:0",
+    )
+)
+
+processor = (
+    AutoProcessor.from_pretrained(
+        TEACHER_NAME
+    )
+)
+
+
+OUTPUT_PATH.parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+with OUTPUT_PATH.open(
+    "a",
+    encoding="utf-8",
+) as out:
+
+    for step in range(MAX_STEPS):
+
+        if target_schedule[step] != "teacher":
+            continue
+
+        record = records[
+            step % len(records)
+        ]
+
+        question, _ = (
+            first_training_pair(record)
+        )
+
+        image_name = str(
+            record["image"]
+        )
+
+        key = (
+            image_name,
+            question,
+        )
+
+        if key in cached:
+            continue
+
+        image = Image.open(
+            IMAGE_DIR / image_name
+        ).convert("RGB")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": image,
+                    },
+                    {
+                        "type": "text",
+                        "text": question,
+                    },
+                ],
+            }
+        ]
+
+        prompt = (
+            processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        )
+
+        inputs = processor(
+            text=[prompt],
+            images=[image],
+            return_tensors="pt",
+        ).to("cuda:0")
+
+        generated_ids = teacher.generate(
+            **inputs,
+            max_new_tokens=64,
+            do_sample=False,
+        )
+
+        response = (
+            processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )[0]
+            .strip()
+        )
+
+        item = {
+            "image": image_name,
+            "question": question,
+            "teacher_response": response,
+        }
+
+        out.write(
+            json.dumps(
+                item,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+        out.flush()
+
+        cached[key] = response
+```
+
+======================================================================
+3. 50K DATASET CREATION
+======================================================================
+
+The 50K dataset was constructed by:
+- preserving the existing 10K records
+- selecting 40K additional records from the original LLaVA-Instruct data
+- using random seed 123
+- combining and shuffling the result
+
+Conceptual code:
+
+```python
+import json
+import random
+
+SOURCE = "llava_instruct_150k.json"
+
+TEN_K = "data/train_llava/train_10000.json"
+
+OUTPUT = "data/train_llava/train_50000.json"
+
+with open(SOURCE, "r", encoding="utf-8") as f:
+    source = json.load(f)
+
+with open(TEN_K, "r", encoding="utf-8") as f:
+    records_10k = json.load(f)
+
+existing_ids = {
+    id(x)
+    for x in records_10k
+}
+
+remaining = [
+    x
+    for x in source
+    if id(x) not in existing_ids
+]
+
+rng = random.Random(123)
+
+additional = rng.sample(
+    remaining,
+    40000,
+)
+
+combined = (
+    records_10k
+    +
+    additional
+)
+
+rng.shuffle(combined)
+
+assert len(combined) == 50000
+
+with open(
+    OUTPUT,
+    "w",
+    encoding="utf-8",
+) as f:
+
+    json.dump(
+        combined,
+        f,
+        ensure_ascii=False,
+    )
+```
+
+Final dataset:
+- 50,000 records
+- 41,414 unique images
+
+======================================================================
+4. IMAGE LIST CREATION
+======================================================================
+
+```python
+import json
+
+TRAIN_PATH = (
+    "data/train_llava/"
+    "train_50000.json"
+)
+
+OUTPUT = (
+    "data/train_llava/"
+    "image_list_50000.txt"
+)
+
+with open(
+    TRAIN_PATH,
+    "r",
+    encoding="utf-8",
+) as f:
+
+    records = json.load(f)
+
+images = sorted(
+    {
+        str(record["image"])
+        for record in records
+    }
+)
+
+with open(
+    OUTPUT,
+    "w",
+    encoding="utf-8",
+) as f:
+
+    for image in images:
+        f.write(
+            image + "\n"
+        )
+
+print(
+    "Unique images:",
+    len(images)
+)
+```
+
+======================================================================
+5. IMAGE DOWNLOAD
+======================================================================
+
+The project used COCO train2017 image URLs and a ThreadPoolExecutor.
+
+```python
+import concurrent.futures
+from pathlib import Path
+
+import requests
+
+IMAGE_DIR = Path(
+    "data/train_llava/images"
+)
+
+LIST_PATH = Path(
+    "data/train_llava/"
+    "image_list_missing_50000.txt"
+)
+
+FAILED_PATH = Path(
+    "data/train_llava/"
+    "failed_images_50000.txt"
+)
+
+IMAGE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+def download_one(image_name):
+
+    output = IMAGE_DIR / image_name
+
+    if (
+        output.exists()
+        and output.stat().st_size > 0
+    ):
+        return "existing", image_name
+
+    url = (
+        "http://images.cocodataset.org/"
+        "train2017/"
+        + image_name
+    )
+
+    for attempt in range(3):
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=60,
+            )
+
+            response.raise_for_status()
+
+            data = response.content
+
+            # JPEG SOI marker
+            if not data.startswith(
+                b"\xff\xd8"
+            ):
+                raise ValueError(
+                    "Invalid JPEG"
+                )
+
+            output.write_bytes(data)
+
+            return "downloaded", image_name
+
+        except Exception:
+
+            if attempt == 2:
+                return "failed", image_name
+
+    return "failed", image_name
+
+
+with open(
+    LIST_PATH,
+    "r",
+    encoding="utf-8",
+) as f:
+
+    image_names = [
+        x.strip()
+        for x in f
+        if x.strip()
+    ]
+
+
+failed = []
+
+with concurrent.futures.ThreadPoolExecutor(
+    max_workers=16
+) as executor:
+
+    futures = [
+        executor.submit(
+            download_one,
+            name,
+        )
+        for name in image_names
+    ]
+
+    for future in (
+        concurrent.futures.as_completed(
+            futures
+        )
+    ):
+
+        status, name = (
+            future.result()
+        )
+
+        if status == "failed":
+            failed.append(name)
+
+
+with open(
+    FAILED_PATH,
+    "w",
+    encoding="utf-8",
+) as f:
+
+    for name in failed:
+        f.write(
+            name + "\n"
+        )
+```
+
+======================================================================
+6. CHECKPOINT RESUME
+======================================================================
+
+The corrected checkpoint used for the 50K run:
+
+    checkpoints/offline_mixed_kd_2b_50k_final/step_3000
+
+It contained:
+
+    adapter_model.safetensors
+    adapter_config.json
+    optimizer.pt
+    training_state.json
+    processor_config.json
+    tokenizer_config.json
+    tokenizer.json
+    chat_template.jinja
+    README.md
+
+training_state.json:
+
+```json
+{
+  "step": 3000,
+  "loss": 0.25368478894233704,
+  "timestamp": "2026-10-07T18:47:04.600892"
+}
+```
+
+Resume code:
+
+```python
+from peft import PeftModel
+
+student = (
+    Qwen3VLForConditionalGeneration
+    .from_pretrained(
+        STUDENT_NAME,
+        torch_dtype=torch.float16,
+        device_map="cuda:0",
+    )
+)
+
+student = PeftModel.from_pretrained(
+    student,
+    "checkpoints/"
+    "offline_mixed_kd_2b_50k_final/"
+    "step_3000",
+    is_trainable=True,
+)
+
+optimizer = torch.optim.AdamW(
+    [
+        p
+        for p in student.parameters()
+        if p.requires_grad
+    ],
+    lr=1e-5,
+)
+
+optimizer.load_state_dict(
+    torch.load(
+        "checkpoints/"
+        "offline_mixed_kd_2b_50k_final/"
+        "step_3000/"
+        "optimizer.pt",
+        map_location="cpu",
+    )
+)
+
+start_step = 3000
+
+for step in range(
+    start_step,
+    50000,
+):
+    # continue normal training
+    ...
+```
+
+======================================================================
+7. MMBENCH EVALUATION
+======================================================================
+
+Official evaluation was performed using VLMEvalKit.
+
+Important official results:
+
+2B baseline:
+    EN = 66.58%
+    CN = 66.15%
+
+2B Mixed/Offline-response KD 10K:
+    EN = 74.31%
+    CN = 73.97%
+
+8B teacher:
+    EN = 74.48%
+    CN = 77.66%
+
+The old initial 50K run:
+    EN = 65.12%
+    CN = 64.09%
+
+Those old 50K numbers are INVALID because the teacher-target cache was corrupted/mismatched.
+
+Do not present those as the final 50K result.
+
+======================================================================
+8. IMPORTANT PROJECT TERMINOLOGY
+======================================================================
+
+Correct description:
+
+    Offline response-level knowledge distillation
+    with ground-truth mixing.
+
+Not:
+
+    Online + offline KD.
+
+Not:
+
+    Simultaneous online and offline KD.
+
+The teacher generates responses BEFORE student training.
+
+Student training then uses:
+
+    75% ground truth
+    25% cached teacher responses
+
+The teacher is not loaded during student training.
+
+======================================================================
+9. WHAT THE STUDENT ACTUALLY LEARNS
+======================================================================
+
+Input:
+
+    Image + Question
+
+Target:
+
+    Ground-truth answer
+    OR
+    Offline teacher answer
+
+Loss:
+
+    Token-level Cross Entropy
+
+Prompt/image tokens:
+
+    masked with -100
+
+Only assistant response tokens contribute to loss.
+
+Backpropagation:
+
+    loss.backward()
+
+Optimization:
+
+    AdamW
+
+Trainable parameters:
+
+    LoRA adapters only
+
+Base Qwen3-VL-2B:
+
+    frozen
+
+LoRA:
+
+    r=8
+    alpha=16
+    dropout=0.05
+    q_proj
+    k_proj
+    v_proj
+    o_proj
+
+Precision:
+
+    float16
+
+Learning rate:
+
+    1e-5
+
+Seed:
+
+    123
+
+======================================================================
+10. ONE-SENTENCE TECHNICAL DESCRIPTION
+======================================================================
+
+"We freeze the Qwen3-VL-2B base model and train LoRA adapters using
+token-level cross-entropy on assistant response tokens, where 75% of
+optimization steps use the original ground-truth answer and 25% use
+responses generated offline by the frozen Qwen3-VL-8B teacher."
+
+======================================================================
+11. PROJECT PIPELINE
+======================================================================
+
+LLaVA-Instruct
+      |
+      v
+10K / 50K records
+      |
+      +------------------------------+
+      |                              |
+      v                              v
+Ground-truth answer          Qwen3-VL-8B teacher
+                                     |
+                                     v
+                            Offline teacher response
+                                     |
+                                     v
+                                   Cache
+      |                              |
+      +---------------+--------------+
+                      |
+                      v
+             75% GT / 25% Teacher
+                      |
+                      v
+              Qwen3-VL-2B
+                 + LoRA
+                      |
+                      v
+             Cross-Entropy Loss
+                      |
+                      v
+               AdamW update
+                      |
+                      v
+             Trained 2B adapter
+                      |
+                      v
+             MMBench EN / CN
+                      |
+                      v
+                Comparison
+```
+
+======================================================================
+12. FINAL PRESENTATION EXPLANATION
+======================================================================
+
+"We use Qwen3-VL-8B as a frozen teacher and Qwen3-VL-2B as the student.
+We first generate teacher responses offline and cache them using the
+image-question pair, because one image can have multiple questions.
+
+We then train only LoRA adapters on the 2B model. The training uses a
+fixed 75/25 schedule: 75% of optimization steps use the original
+ground-truth answer and 25% use the cached teacher response.
+
+For both types of targets, we use standard token-level cross-entropy
+and mask the prompt so that only assistant response tokens contribute
+to the loss.
+
+Thus, this is offline response-level KD with ground-truth mixing, not
+online KD. The final student is evaluated against the original 2B
+baseline and 8B teacher using MMBench English and Chinese."
